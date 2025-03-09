@@ -1,14 +1,14 @@
-# submission.py
 import os
 import re
 import json
 import pandas as pd
 import numpy as np
 import torch
-from transformers import RagTokenizer, RagRetriever, RagTokenForGeneration, T5Tokenizer, T5ForConditionalGeneration
+from transformers import PreTrainedTokenizerFast, BartForConditionalGeneration, T5Tokenizer, T5ForConditionalGeneration
 from sentence_transformers import SentenceTransformer, util
 import faiss
 import pdfplumber  # PDF 파싱을 위한 라이브러리
+import tqdm 
 
 # ==============================
 # 1. 데이터 전처리 모듈
@@ -26,15 +26,13 @@ class DataProcessor:
 
     def load_train_data(self, filepath):
         df = pd.read_csv(filepath)
-        # 컬럼명은 train.csv에 따라 조정 (예: '온도', '습도', '사고발생상황', '원인', '대책')
-        for col in ['사고발생상황', '원인', '대책']:
+        for col in ['작업프로세스', '사고원인', '재발방지대책 및 향후조치계획']:
             df[col] = df[col].apply(self.clean_text)
         return df
 
     def load_test_data(self, filepath):
         df = pd.read_csv(filepath)
-        # test 데이터에도 동일한 전처리 적용
-        for col in ['사고발생상황', '원인']:
+        for col in ['작업프로세스', '사고원인']:
             df[col] = df[col].apply(self.clean_text)
         return df
 
@@ -42,7 +40,7 @@ class DataProcessor:
 # 2. PDF 건설안전지침 벡터 DB 구축 모듈
 # ==============================
 class PDFVectorizer:
-    def __init__(self, pdf_folder, embed_model_name='jhgan/ko-sbert-sts'):
+    def __init__(self, pdf_folder, embed_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
         self.pdf_folder = pdf_folder
         self.embedder = SentenceTransformer(embed_model_name)
         self.texts = []
@@ -85,23 +83,38 @@ class PDFVectorizer:
         return results
 
 # ==============================
-# 3. RAG 기반 생성 모듈
+# 3. 한국어 전용 생성 모듈 (KoBART 기반)
 # ==============================
-class RAGGenerator:
-    def __init__(self, passages_file='passages.json'):
-        # passages_file는 train 데이터의 사고발생상황을 JSON으로 저장한 파일
-        self.tokenizer = RagTokenizer.from_pretrained("facebook/rag-token-nq")
-        self.retriever = RagRetriever.from_pretrained("facebook/rag-token-nq",
-                                                      index_name="custom",
-                                                      passages_path=passages_file)
-        self.model = RagTokenForGeneration.from_pretrained("facebook/rag-token-nq")
+class KoreanRAGGenerator:
+    def __init__(self, passages_file='passages.json', embed_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+        self.tokenizer = PreTrainedTokenizerFast.from_pretrained("hyunwoongko/kobart")
+        self.model = BartForConditionalGeneration.from_pretrained("hyunwoongko/kobart")
+        
+        with open(passages_file, "r", encoding="utf-8") as f:
+            self.passages = json.load(f)
+        self.passage_texts = [p["text"] for p in self.passages]
+        
+        self.embedder = SentenceTransformer(embed_model_name)
+        self.passage_embeddings = self.embedder.encode(self.passage_texts, convert_to_tensor=True)
+
+    def retrieve(self, query, top_k=1):
+        query_emb = self.embedder.encode(query, convert_to_tensor=True)
+        sims = util.cos_sim(query_emb, self.passage_embeddings)[0]
+        top_results = torch.topk(sims, k=top_k)
+        indices = top_results.indices.tolist()
+        retrieved_texts = [self.passage_texts[i] for i in indices]
+        return retrieved_texts
 
     def generate(self, query, max_length=200, num_beams=5):
-        inputs = self.tokenizer(query, return_tensors="pt")
+        retrieved = self.retrieve(query, top_k=1)
+        context = retrieved[0] if retrieved else ""
+        final_query = query + " " + context
+        inputs = self.tokenizer(final_query, return_tensors="pt", max_length=512, truncation=True)
         generated_ids = self.model.generate(
             input_ids=inputs["input_ids"],
             num_beams=num_beams,
-            max_length=max_length
+            max_length=max_length,
+            early_stopping=True
         )
         output = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return output
@@ -112,7 +125,7 @@ class RAGGenerator:
         for idx, row in train_df.iterrows():
             passage = {
                 "title": f"doc_{idx}",
-                "text": row['사고발생상황'],
+                "text": row['작업프로세스'],
                 "id": idx
             }
             passages.append(passage)
@@ -149,9 +162,8 @@ class LLMGenerator:
 
     def get_few_shot_examples(self, train_df, n_shot=3):
         examples = ""
-        # n_shot 만큼 예시 추출 (상황, 원인, 대책)
         for idx, row in train_df.head(n_shot).iterrows():
-            example = f"사고 상황 및 원인: {row['사고발생상황']} / {row['원인']}\n대책: {row['대책']}\n\n"
+            example = f"사고 상황 및 원인: {row['작업프로세스']} / {row['사고원인']}\n대책: {row['재발방지대책 및 향후조치계획']}\n\n"
             examples += example
         return examples
 
@@ -160,26 +172,24 @@ class LLMGenerator:
 # ==============================
 class SupervisedModel:
     def __init__(self, model_name="t5-base"):
-        # 실제로는 미세조정된 모델을 로드할 것
         self.tokenizer = T5Tokenizer.from_pretrained(model_name)
         self.model = T5ForConditionalGeneration.from_pretrained(model_name)
 
     def generate(self, input_text, max_length=150, num_beams=5):
-        inputs = self.tokenizer.encode(input_text, return_tensors="pt", max_length=512, truncation=True)
-        outputs = self.model.generate(
-            inputs, 
-            max_length=max_length, 
-            num_beams=num_beams, 
-            early_stopping=True
+        inputs = self.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
+        generated_ids = self.model.generate(
+            input_ids=inputs['input_ids'],
+            max_length=max_length,
+            num_beams=num_beams
         )
-        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return result
+        output = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        return output
 
 # ==============================
 # 6. Ensemble 예측 모듈
 # ==============================
 class EnsemblePredictor:
-    def __init__(self, embed_model_name='jhgan/ko-sbert-sts'):
+    def __init__(self, embed_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
         self.embedder = SentenceTransformer(embed_model_name)
 
     def cosine_sim(self, text1, text2):
@@ -204,10 +214,10 @@ class EnsemblePredictor:
 # ==============================
 def main():
     # 파일 경로 설정
-    train_path = "train.csv"
-    test_path = "test.csv"
-    sample_sub_path = "sample_submission.csv"
-    pdf_folder = "./pdf_guidelines"  # 건설안전지침 PDF들이 저장된 폴더
+    train_path = os.path.join(os.getcwd(), "..", "1.Data", "train.csv")
+    test_path = os.path.join(os.getcwd(), "..", "1.Data", "test.csv")
+    sample_sub_path = os.path.join(os.getcwd(), "..", "1.Data", "sample_submission.csv")
+    pdf_folder = os.path.join(os.getcwd(), "..", "1.Data", "건설안전지침")  # 건설안전지침 PDF들이 저장된 폴더
 
     # 1. 데이터 로드
     dp = DataProcessor()
@@ -220,8 +230,8 @@ def main():
 
     # 3. RAG용 passages 생성 (train 데이터의 사고발생상황 활용)
     passages_file = "passages.json"
-    RAGGenerator.create_passages(train_df, passages_file)
-    rag_generator = RAGGenerator(passages_file)
+    KoreanRAGGenerator.create_passages(train_df, passages_file)
+    rag_generator = KoreanRAGGenerator(passages_file)
 
     # 4. LLM 기반 생성 준비 (Few-shot 예시 포함)
     llm_generator = LLMGenerator("t5-base")
@@ -231,12 +241,12 @@ def main():
     supervised_model = SupervisedModel("t5-base")
 
     # 6. Ensemble 예측 모듈 준비
-    ensemble_predictor = EnsemblePredictor('jhgan/ko-sbert-sts')
+    ensemble_predictor = EnsemblePredictor("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
     predictions = []
-    for idx, row in test_df.iterrows():
+    for idx, row in tqdm.tqdm(test_df.iterrows(), total=len(test_df)):
         # 사고 상황 및 원인, 환경정보를 하나의 입력 텍스트로 구성
-        accident_info = f"온도: {row.get('온도', '')}, 습도: {row.get('습도', '')}, 사고발생상황: {row.get('사고발생상황', '')}, 원인: {row.get('원인', '')}"
+        accident_info = f"온도: {row.get('온도', '')}, 사고객체: {row.get('사고객체', '')}, 작업프로세스: {row.get('작업프로세스', '')}, 사고원인: {row.get('사고원인', '')}"
 
         # PDF 도메인 지식 활용: 입력과 관련된 건설안전지침 검색
         pdf_guidelines = pdf_vectorizer.search(accident_info, top_k=1)
@@ -259,7 +269,7 @@ def main():
 
     # 7. Submission 파일 생성
     submission = pd.read_csv(sample_sub_path)
-    submission['대책'] = predictions  # sample_submission에 맞게 '대책' 컬럼 명 확인
+    submission['재발방지대책 및 향후조치계획'] = predictions  # sample_submission에 맞게 '재발방지대책 및 향후조치계획' 컬럼 명 확인
     submission.to_csv("final_submission.csv", index=False, encoding="utf-8-sig")
     print("Submission 파일 생성 완료: final_submission.csv")
 
