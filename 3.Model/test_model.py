@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from transformers import PreTrainedTokenizerFast, BartForConditionalGeneration, T5Tokenizer, T5ForConditionalGeneration
 from sentence_transformers import SentenceTransformer, util
-import faiss  # <-- 기존에 벡터화용 라이브러리지만 여기선 안 쓰거나, 상황에 맞춰 제거 가능
+# import faiss  # <-- 기존에 벡터화용 라이브러리지만 여기선 안 쓰거나, 상황에 맞춰 제거 가능
 import tqdm
 
 # ==============================
