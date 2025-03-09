@@ -1,4 +1,5 @@
-# pip install PDFPlumber #
+# pip install PDFPlumber 
+# pdf들을 하나로 합쳐주는 코드입니다.
 
 import numpy as np
 import pandas as pd
