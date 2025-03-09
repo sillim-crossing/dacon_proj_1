@@ -1,14 +1,14 @@
 import os
 import re
 import json
+import ast
 import pandas as pd
 import numpy as np
 import torch
 from transformers import PreTrainedTokenizerFast, BartForConditionalGeneration, T5Tokenizer, T5ForConditionalGeneration
 from sentence_transformers import SentenceTransformer, util
-import faiss
-import pdfplumber  # PDF 파싱을 위한 라이브러리
-import tqdm 
+import faiss  # <-- 기존에 벡터화용 라이브러리지만 여기선 안 쓰거나, 상황에 맞춰 제거 가능
+import tqdm
 
 # ==============================
 # 1. 데이터 전처리 모듈
@@ -19,81 +19,112 @@ class DataProcessor:
 
     def clean_text(self, text):
         if isinstance(text, str):
-            text = re.sub(r'\s+', ' ', text).strip()
+            text = re.sub(r'\s+', ' ', text).strip()  # 2개 이상 공백 및 앞뒤 공백 제거
         else:
             text = ""
         return text
 
     def load_train_data(self, filepath):
+        """
+        train.csv 예시 컬럼: ['질문', '답변'] 또는
+        ['작업프로세스', '사고원인', '재발방지대책 및 향후조치계획'] 등
+        """
         df = pd.read_csv(filepath)
+        # 예시: '작업프로세스', '사고원인', '재발방지대책' 등을 clean
+        # 실제 컬럼명에 맞춰 수정
         for col in ['작업프로세스', '사고원인', '재발방지대책 및 향후조치계획']:
-            df[col] = df[col].apply(self.clean_text)
+            if col in df.columns:
+                df[col] = df[col].apply(self.clean_text)
         return df
 
     def load_test_data(self, filepath):
+        """
+        test.csv 예시 컬럼: ['질문'] 혹은
+        ['작업프로세스', '사고원인'] 등
+        """
         df = pd.read_csv(filepath)
         for col in ['작업프로세스', '사고원인']:
-            df[col] = df[col].apply(self.clean_text)
+            if col in df.columns:
+                df[col] = df[col].apply(self.clean_text)
         return df
 
 # ==============================
-# 2. PDF 건설안전지침 벡터 DB 구축 모듈
+# 2. CSV를 활용한 PDF 문장 검색 모듈
 # ==============================
-class PDFVectorizer:
-    def __init__(self, pdf_folder, embed_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
-        self.pdf_folder = pdf_folder
-        self.embedder = SentenceTransformer(embed_model_name)
-        self.texts = []
-        self.ids = []
-        self.index = None
-
-    def parse_pdf(self, pdf_path):
-        text = ""
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() + " "
-        except Exception as e:
-            print(f"Error reading {pdf_path}: {e}")
-        return text.strip()
-
-    def vectorize_pdfs(self):
-        file_list = [f for f in os.listdir(self.pdf_folder) if f.endswith('.pdf')]
-        for i, file in enumerate(file_list):
-            full_path = os.path.join(self.pdf_folder, file)
-            txt = self.parse_pdf(full_path)
-            if txt:
-                self.texts.append(txt)
-                self.ids.append(i)
-        if self.texts:
-            embeddings = self.embedder.encode(self.texts, convert_to_numpy=True)
-            d = embeddings.shape[1]
-            self.index = faiss.IndexFlatL2(d)
-            self.index.add(embeddings)
-            print(f"Indexed {len(self.texts)} PDF documents.")
-        else:
-            print("No PDF texts found.")
+class PDFCsvRetriever:
+    """
+    pdf_info.csv 예시 컬럼:
+    - '질문'
+    - '키워드'
+    - 'PDF 파일명'
+    - '유사도'
+    - 'PDF 내 관련 문장' (문장 리스트나 문자열)
+    """
+    def __init__(self, csv_path):
+        self.df = pd.read_csv(csv_path)
+        # 'PDF 내 관련 문장'이 리스트 형태로 저장돼있다면 literal_eval로 파싱해야 할 수도 있음
+        if isinstance(self.df.iloc[0]['PDF 내 관련 문장'], str):
+            try:
+                # 샘플 첫 행을 파싱 시도 → 전체를 일괄 처리
+                sample_val = ast.literal_eval(self.df.iloc[0]['PDF 내 관련 문장'])
+                # 성공 시 전체에 적용
+                self.df['PDF 내 관련 문장'] = self.df['PDF 내 관련 문장'].apply(lambda x: ast.literal_eval(x))
+            except:
+                # 이미 문자열이거나 파싱 불가능하면 그대로 둠
+                pass
 
     def search(self, query, top_k=3):
-        if self.index is None:
+        """
+        이미 CSV에 질문별 유사도가 계산돼 있다면,
+        1) query와 동일(또는 유사)한 질문 행만 필터링
+        2) 유사도 기준 내림차순 정렬
+        3) 상위 top_k 'PDF 내 관련 문장' 반환
+        """
+        # (1) 질문 일치하는 행만 필터링 (예시: 정확 일치)
+        # 만약 실제로는 부분 일치나 Embedding Search를 하고 싶다면 추가 로직 필요
+        filtered = self.df[self.df['질문'] == query].copy()
+
+        if len(filtered) == 0:
+            # CSV에 없는 새로운 질문일 경우, 빈 리스트 반환
             return []
-        query_emb = self.embedder.encode([query], convert_to_numpy=True)
-        D, I = self.index.search(query_emb, top_k)
-        results = [self.texts[i] for i in I[0] if i < len(self.texts)]
-        return results
+
+        # (2) 유사도 높은 순 정렬
+        filtered.sort_values(by='유사도', ascending=False, inplace=True)
+        top_rows = filtered.head(top_k)
+
+        # (3) PDF 내 관련 문장들을 하나로 합치거나 리스트로 반환
+        # 여기서는 여러 행의 여러 문장을 이어붙여 하나의 문장으로 만드는 예시
+        merged_context = []
+        for row in top_rows.itertuples():
+            # 'PDF 내 관련 문장'이 list라면 하나씩 추출
+            if isinstance(row._5, list):  # row._5 == row['PDF 내 관련 문장']
+                for txt_tuple in row._5:
+                    # txt_tuple이 (파일명, 문장) 형태라면 문장만 추출
+                    if isinstance(txt_tuple, tuple) and len(txt_tuple) > 1:
+                        merged_context.append(txt_tuple[1])
+                    else:
+                        merged_context.append(str(txt_tuple))
+            else:
+                # 문자열인 경우 그대로
+                merged_context.append(str(row._5))
+
+        # 최종적으로는 하나의 긴 문자열로 합치거나, 리스트 그대로 반환 가능
+        final_context = " ".join(merged_context)
+        return [final_context]
 
 # ==============================
-# 3. 한국어 전용 생성 모듈 (KoBART 기반)
+# 3. 한국어 전용 생성 모듈 (KoBART 기반 RAG)
 # ==============================
 class KoreanRAGGenerator:
     def __init__(self, passages_file='passages.json', embed_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained("hyunwoongko/kobart")
         self.model = BartForConditionalGeneration.from_pretrained("hyunwoongko/kobart")
-        
+
+        # passages.json이 기존 RAG 용도로 만든 파일이라면
         with open(passages_file, "r", encoding="utf-8") as f:
             self.passages = json.load(f)
         self.passage_texts = [p["text"] for p in self.passages]
-        
+
         self.embedder = SentenceTransformer(embed_model_name)
         self.passage_embeddings = self.embedder.encode(self.passage_texts, convert_to_tensor=True)
 
@@ -121,11 +152,14 @@ class KoreanRAGGenerator:
 
     @staticmethod
     def create_passages(train_df, passages_file='passages.json'):
+        """
+        기존 RAG 방식: train_df의 일부 컬럼을 passage로 만들어 저장
+        """
         passages = []
         for idx, row in train_df.iterrows():
             passage = {
                 "title": f"doc_{idx}",
-                "text": row['작업프로세스'],
+                "text": row.get('작업프로세스', ''),  # 혹은 질문(쿼리)로 할 수도 있음
                 "id": idx
             }
             passages.append(passage)
@@ -134,7 +168,7 @@ class KoreanRAGGenerator:
         print(f"Passages saved to {passages_file}")
 
 # ==============================
-# 4. LLM 프롬프트 엔지니어링 기반 생성 모듈
+# 4. LLM 프롬프트 엔지니어링 기반 생성 모듈 (T5)
 # ==============================
 class LLMGenerator:
     def __init__(self, model_name="t5-base"):
@@ -152,23 +186,27 @@ class LLMGenerator:
     def generate(self, prompt, max_length=150, num_beams=5):
         inputs = self.tokenizer.encode(prompt, return_tensors="pt", max_length=512, truncation=True)
         outputs = self.model.generate(
-            inputs, 
-            max_length=max_length, 
-            num_beams=num_beams, 
+            inputs,
+            max_length=max_length,
+            num_beams=num_beams,
             early_stopping=True
         )
         decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         return decoded
 
     def get_few_shot_examples(self, train_df, n_shot=3):
+        """
+        예시: train_df에서 상위 n_shot개를 추출하여 prompt에 넣을 few-shot 템플릿 생성
+        """
         examples = ""
         for idx, row in train_df.head(n_shot).iterrows():
-            example = f"사고 상황 및 원인: {row['작업프로세스']} / {row['사고원인']}\n대책: {row['재발방지대책 및 향후조치계획']}\n\n"
+            # 실제 컬럼명에 맞춰 수정 (예: 질문 + 대책)
+            example = f"사고 상황 및 원인: {row.get('작업프로세스','')} / {row.get('사고원인','')}\n대책: {row.get('재발방지대책 및 향후조치계획','')}\n\n"
             examples += example
         return examples
 
 # ==============================
-# 5. 지도학습 기반 모델 모듈 (Supervised)
+# 5. 지도학습 기반 모델 모듈 (Supervised, T5)
 # ==============================
 class SupervisedModel:
     def __init__(self, model_name="t5-base"):
@@ -199,7 +237,11 @@ class EnsemblePredictor:
         return cos_sim
 
     def ensemble(self, preds):
-        # 단순 앙상블: S-BERT Cosine 유사도를 측정하여 가장 공통된(유사한) 예측 선택
+        """
+        단순 앙상블:
+        S-BERT Cosine 유사도를 측정하여
+        가장 '서로 간의' 유사도가 높은(공통적으로 비슷한) 예측을 선택
+        """
         n = len(preds)
         scores = np.zeros(n)
         for i in range(n):
@@ -213,63 +255,67 @@ class EnsemblePredictor:
 # 7. 최종 파이프라인 및 Submission 생성
 # ==============================
 def main():
-    # 파일 경로 설정
+    # 파일 경로 설정 (사용 환경에 맞춰 수정)
     train_path = os.path.join(os.getcwd(), "..", "1.Data", "train.csv")
     test_path = os.path.join(os.getcwd(), "..", "1.Data", "test.csv")
     sample_sub_path = os.path.join(os.getcwd(), "..", "1.Data", "sample_submission.csv")
-    pdf_folder = os.path.join(os.getcwd(), "..", "1.Data", "건설안전지침")  # 건설안전지침 PDF들이 저장된 폴더
+    pdf_info_path = os.path.join(os.getcwd(), "..", "1.Data", "pdf_info.csv")  # PDF 정보가 담긴 CSV
 
     # 1. 데이터 로드
     dp = DataProcessor()
     train_df = dp.load_train_data(train_path)
     test_df = dp.load_test_data(test_path)
 
-    # 2. PDF 벡터 DB 구축 (옵션: PDF가 있을 경우)
-    pdf_vectorizer = PDFVectorizer(pdf_folder)
-    pdf_vectorizer.vectorize_pdfs()
+    # 2. PDF CSV 기반 검색기 준비
+    pdf_retriever = PDFCsvRetriever(pdf_info_path)
 
-    # 3. RAG용 passages 생성 (train 데이터의 사고발생상황 활용)
+    # 3. RAG용 passages 생성 (옵션)
     passages_file = "passages.json"
     KoreanRAGGenerator.create_passages(train_df, passages_file)
     rag_generator = KoreanRAGGenerator(passages_file)
 
-    # 4. LLM 기반 생성 준비 (Few-shot 예시 포함)
+    # 4. LLM(T5) 기반 생성 준비 (Few-shot 예시 포함)
     llm_generator = LLMGenerator("t5-base")
     few_shot_examples = llm_generator.get_few_shot_examples(train_df, n_shot=3)
 
-    # 5. 지도학습 기반 모델 준비
+    # 5. 지도학습 기반 모델 준비 (T5)
     supervised_model = SupervisedModel("t5-base")
 
     # 6. Ensemble 예측 모듈 준비
     ensemble_predictor = EnsemblePredictor("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
+    # 추론 및 예측 결과 저장
     predictions = []
     for idx, row in tqdm.tqdm(test_df.iterrows(), total=len(test_df)):
-        # 사고 상황 및 원인, 환경정보를 하나의 입력 텍스트로 구성
-        accident_info = f"온도: {row.get('온도', '')}, 사고객체: {row.get('사고객체', '')}, 작업프로세스: {row.get('작업프로세스', '')}, 사고원인: {row.get('사고원인', '')}"
+        # test_df 컬럼 예시: ['작업프로세스', '사고원인', ...] → 질문 구성
+        # 또는 row['질문']이 직접 있을 수도 있음
+        # 여기서는 임의로 accident_info를 만든 예시
+        accident_info = f"작업프로세스: {row.get('작업프로세스','')}, 사고원인: {row.get('사고원인','')}"
 
-        # PDF 도메인 지식 활용: 입력과 관련된 건설안전지침 검색
-        pdf_guidelines = pdf_vectorizer.search(accident_info, top_k=1)
-        domain_context = pdf_guidelines[0] if pdf_guidelines else ""
+        # (1) CSV에서 해당 accident_info와 일치(또는 유사)하는 질문 행 찾아서 문맥 가져오기
+        pdf_contexts = pdf_retriever.search(accident_info, top_k=1)
+        domain_context = pdf_contexts[0] if pdf_contexts else ""
 
-        # 최종 입력: 도메인 지식 포함
+        # (2) 최종 입력: 도메인 지식 포함
         final_input = accident_info + " " + domain_context
 
-        # 각 모듈별 예측 생성
+        # (3) 각 모듈별 예측 생성
         pred_rag = rag_generator.generate(final_input)
         prompt = llm_generator.create_prompt(few_shot_examples, final_input)
         pred_llm = llm_generator.generate(prompt)
         pred_supervised = supervised_model.generate(final_input)
 
-        # Ensemble: 3가지 예측 중 S-BERT 유사도가 가장 높은(상호 일치하는) 예측 선택
+        # (4) 앙상블: 3가지 예측 중 서로 가장 비슷한(유사도 높은) 예측 선택
         pred_candidates = [pred_rag, pred_llm, pred_supervised]
         final_pred = ensemble_predictor.ensemble(pred_candidates)
         predictions.append(final_pred)
-        print(f"Test idx {idx} 예측 완료.")
+
+        print(f"Test idx {idx} 예측 완료. → {final_pred[:80]}...")
 
     # 7. Submission 파일 생성
     submission = pd.read_csv(sample_sub_path)
-    submission['재발방지대책 및 향후조치계획'] = predictions  # sample_submission에 맞게 '재발방지대책 및 향후조치계획' 컬럼 명 확인
+    # sample_submission.csv의 '재발방지대책 및 향후조치계획' 컬럼에 결과 할당 (컬럼명 맞춰야 함)
+    submission['재발방지대책 및 향후조치계획'] = predictions
     submission.to_csv("final_submission.csv", index=False, encoding="utf-8-sig")
     print("Submission 파일 생성 완료: final_submission.csv")
 
