@@ -1,5 +1,3 @@
-# train데이터에서 문장의 불용어를 제거하고 카테고리를 분리해서 나눠주는 등 전처리를 해주는 코드입니다.
-
 import os
 import re
 import jpype
@@ -46,7 +44,7 @@ def preprocessing(text, remove_stopwords=True):
     cleaned_text = " ".join(filtered_words)
 
     return cleaned_text
-
+  
 # 🔹 **경로 설정**
 script_dir = os.path.dirname(os.path.abspath(__file__))
 train_path = os.path.join(script_dir, "..", "1.Data", "train.csv")
@@ -57,15 +55,17 @@ train = pd.read_csv(train_path)
 test = pd.read_csv(test_path)
 
 # ✅ **(2) 불필요한 열 삭제**
-drop_columns = ["발생일시", "사고인지 시간", "날씨", "기온", "습도", "연면적", "층 정보", "인적사고", "물적사고", "부위"]
+drop_columns = ["발생일시", "사고인지 시간", "날씨", "기온", "습도", "연면적", "층 정보", "물적사고", "부위"]
 train.drop(columns=drop_columns, inplace=True)
 test.drop(columns=drop_columns, inplace=True)
 
 # ✅ **(3) `공사종류`, `공종`, `사고객체`를 대분류/중분류로 나누기**
-def split_columns(df):
-    df["공종(중분류)"] = df["공종"].str.split(" > ").str[1]
-    df["사고객체(대분류)"] = df["사고객체"].str.split(" > ").str[0]
-    df["사고객체(중분류)"] = df["사고객체"].str.split(" > ").str[1]
+def split_columns(df): 
+    df['공종(중분류)'] = df['공종'].str.split(' > ').str[1]
+    df['사고객체(대분류)'] = df['사고객체'].str.split(' > ').str[0]
+    df['사고객체(중분류)'] = df['사고객체'].str.split(' > ').str[1]
+    df['인적사고(대분류)'] = df['인적사고'].str.split('(').str[0].str.strip()
+    df['인적사고(중분류)'] = df['인적사고'].str.split('(').str[1].str.replace(')', '').str.strip()
 
 split_columns(train)
 split_columns(test)
@@ -76,35 +76,41 @@ train["재발방지대책_정제"] = train["재발방지대책 및 향후조치�
 test["사고원인_정제"] = test["사고원인"].apply(lambda x: preprocessing(x, remove_stopwords=True))
 
 # ✅ **(5) 훈련 데이터 통합 생성**
+# 훈련 데이터 통합 생성
 combined_training_data = train.apply(
     lambda row: {
-        "question": (
+        "question": (  
             f"공종 중분류 '{row['공종(중분류)']}' 작업에서 "
+            f"인적사고 대분류 '{row['인적사고(대분류)']}', 중분류 '{row['인적사고(중분류)']}' "
             f"사고객체 '{row['사고객체(대분류)']}'(중분류: '{row['사고객체(중분류)']}')와 관련된 사고가 발생했습니다. "
-            f"작업 프로세스는 '{row['작업프로세스']}'이며, 사고 원인은 '{row['사고원인_정제']}'입니다. "
+            f"작업 프로세스는 '{row['작업프로세스']}'이며, 사고 원인은 '{row['사고원인']}'입니다. "
             f"재발 방지 대책 및 향후 조치 계획은 무엇인가요?"
         ),
-        "answer": row["재발방지대책_정제"]
+        "answer": row["재발방지대책 및 향후조치계획"]
     },
     axis=1
 )
+# DataFrame으로 변환
+combined_training_data = pd.DataFrame(list(combined_training_data))
 
-# ✅ **(6) 테스트 데이터 통합 생성**
+
+# 테스트 데이터 통합 생성
 combined_test_data = test.apply(
     lambda row: {
         "question": (
             f"공종 중분류 '{row['공종(중분류)']}' 작업에서 "
+            f"인적사고 대분류 '{row['인적사고(대분류)']}', 중분류 '{row['인적사고(중분류)']}' "
             f"사고객체 '{row['사고객체(대분류)']}'(중분류: '{row['사고객체(중분류)']}')와 관련된 사고가 발생했습니다. "
-            f"작업 프로세스는 '{row['작업프로세스']}'이며, 사고 원인은 '{row['사고원인_정제']}'입니다. "
+            f"작업 프로세스는 '{row['작업프로세스']}'이며, 사고 원인은 '{row['사고원인']}'입니다. "
             f"재발 방지 대책 및 향후 조치 계획은 무엇인가요?"
         )
     },
     axis=1
 )
 
-# ✅ **(7) DataFrame 변환**
-combined_training_data = pd.DataFrame(list(combined_training_data))
+# DataFrame으로 변환
 combined_test_data = pd.DataFrame(list(combined_test_data))
+
 
 # ✅ **(8) 저장**
 train_cleaned_path = os.path.join(script_dir, "..", "1.Data", "train_cleaned.csv")
@@ -114,3 +120,9 @@ combined_training_data.to_csv(train_cleaned_path, index=False, encoding="utf-8-s
 combined_test_data.to_csv(test_cleaned_path, index=False, encoding="utf-8-sig")
 
 print(f"\n✅ 전처리 완료! 저장된 파일: {train_cleaned_path}, {test_cleaned_path} 🚀")
+
+
+
+
+
+
